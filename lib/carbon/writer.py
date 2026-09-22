@@ -13,7 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 import time
-from six.moves import queue
+from collections import deque
+import threading
 
 from carbon import state
 from carbon.cache import MetricCache
@@ -53,37 +54,66 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 
 class TagQueue(object):
   def __init__(self, maxsize=0, update_interval=1):
-    self.add_queue = queue.Queue(maxsize)
-    self.update_queue = queue.Queue(maxsize)
-    self.update_interval = update_interval
+    self.maxsize = maxsize
+    self.update_interval = max(1, update_interval)
     self.update_counter = 0
+    self.add_queue = deque()
+    self.update_queue = deque()
+    self.pending_adds = set()
+    self.pending_updates = set()
+    self.lock = threading.Lock()
 
   def add(self, metric):
-    try:
-      self.add_queue.put_nowait(metric)
-    except queue.Full:
-      pass
+    with self.lock:
+      if metric in self.pending_adds:
+        return
+
+      if metric in self.pending_updates:
+        self.update_queue.remove(metric)
+        self.pending_updates.remove(metric)
+      else:
+        self._make_room_for_add()
+        if self.maxsize and self._qsize() >= self.maxsize:
+          return
+
+      self.add_queue.append(metric)
+      self.pending_adds.add(metric)
+
+  def _qsize(self):
+    return len(self.add_queue) + len(self.update_queue)
+
+  def _make_room_for_add(self):
+    if not self.maxsize or self._qsize() < self.maxsize:
+      return
+    if self.update_queue:
+      metric = self.update_queue.popleft()
+      self.pending_updates.discard(metric)
 
   def update(self, metric):
-    self.update_counter = self.update_counter % self.update_interval + 1
-    if self.update_counter == 1:
-      try:
-        self.update_queue.put_nowait(metric)
-      except queue.Full:
-        pass
+    with self.lock:
+      self.update_counter = self.update_counter % self.update_interval + 1
+      should_queue = self.update_counter == 1
+      duplicate = metric in self.pending_adds or metric in self.pending_updates
+
+      if should_queue and not duplicate:
+        if self.maxsize and self._qsize() >= self.maxsize:
+          return
+
+        self.update_queue.append(metric)
+        self.pending_updates.add(metric)
 
   def getbatch(self, maxsize=1):
     batch = []
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.add_queue.get_nowait())
-      except queue.Empty:
-        break
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.update_queue.get_nowait())
-      except queue.Empty:
-        break
+    with self.lock:
+      queues = ((self.add_queue, self.pending_adds),
+                (self.update_queue, self.pending_updates))
+      for queue, pending in queues:
+        while queue and len(batch) < maxsize:
+          metric = queue.popleft()
+          pending.discard(metric)
+          batch.append(metric)
+        if len(batch) >= maxsize:
+          break
     return batch
 
 

@@ -359,8 +359,8 @@ RELAY_CACHE_METRICS = False
 # Tag batch size, this specifies the maximum number of series to be sent to graphite-web in a single batch
 # TAG_BATCH_SIZE = 100
 
-# Tag queue size, this specifies the maximum number of series to be queued for sending to graphite-web
-# There are separate queues for new series and for updates to existing series
+# Tag queue size, this specifies the maximum number of unique series to be queued for sending to graphite-web
+# Queued new series take priority over queued updates to existing series
 # TAG_QUEUE_SIZE = 10000
 
 # Set to enable Sentry.io exception monitoring.
