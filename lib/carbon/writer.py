@@ -52,38 +52,64 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 
 
 class TagQueue(object):
+  """Bounded, de-duplicating queue of tagged series pending tag updates.
+
+  A metric is queued at most once at any given time: repeated add() or
+  update() calls for the same metric are collapsed until the metric is
+  drained by getbatch().  First-time creates (add) are always drained
+  before periodic updates (update), and a pending update is superseded
+  if the metric is (re)created before being drained.
+  """
   def __init__(self, maxsize=0, update_interval=1):
     self.add_queue = queue.Queue(maxsize)
     self.update_queue = queue.Queue(maxsize)
+    self.add_queued = set()
+    self.update_queued = set()
     self.update_interval = update_interval
     self.update_counter = 0
 
   def add(self, metric):
+    if metric in self.add_queued:
+      return
     try:
       self.add_queue.put_nowait(metric)
     except queue.Full:
-      pass
+      return
+    self.add_queued.add(metric)
+    # A pending periodic update is superseded by the (re)create.
+    self.update_queued.discard(metric)
 
   def update(self, metric):
     self.update_counter = self.update_counter % self.update_interval + 1
-    if self.update_counter == 1:
-      try:
-        self.update_queue.put_nowait(metric)
-      except queue.Full:
-        pass
+    if self.update_counter != 1:
+      return
+    if metric in self.add_queued or metric in self.update_queued:
+      return
+    try:
+      self.update_queue.put_nowait(metric)
+    except queue.Full:
+      return
+    self.update_queued.add(metric)
 
   def getbatch(self, maxsize=1):
     batch = []
     while len(batch) < maxsize:
       try:
-        batch.append(self.add_queue.get_nowait())
+        metric = self.add_queue.get_nowait()
       except queue.Empty:
         break
+      self.add_queued.discard(metric)
+      batch.append(metric)
     while len(batch) < maxsize:
       try:
-        batch.append(self.update_queue.get_nowait())
+        metric = self.update_queue.get_nowait()
       except queue.Empty:
         break
+      if metric not in self.update_queued:
+        # Superseded by a pending add, skip the stale entry.
+        continue
+      self.update_queued.discard(metric)
+      batch.append(metric)
     return batch
 
 
